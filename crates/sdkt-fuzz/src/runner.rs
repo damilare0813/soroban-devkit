@@ -152,43 +152,17 @@ fn format_reduction_trace(reductions: &[crate::minimizer::Reduction]) -> String 
         .collect()
 }
 
-#[cfg(test)]
-mod minimization_trace_tests {
-    use super::*;
-    use crate::minimizer::{Minimization, Reduction};
+/// Load and validate an artifact from disk (used by tests + the CLI).
+pub fn load_artifact(path: &Path) -> Result<FindingArtifact, ReplayError> {
+    let json = std::fs::read(path)
+        .map_err(|e| ReplayError::Malformed(format!("reading {}: {e}", path.display())))?;
+    parse_artifact(&json)
+}
 
-    #[test]
-    fn renders_accepted_reductions() {
-        let minimization = Minimization {
-            attempted: true,
-            strategy: "deterministic",
-            original_complexity: 8,
-            minimized_complexity: 3,
-            preserved: true,
-            reductions: vec![Reduction {
-                kind: "arg".into(),
-                detail: "argument 0 → 0".into(),
-                complexity_after: 3,
-            }],
-        };
-        let rendered = format_reduction_trace(&minimization.reductions);
-        assert!(rendered.contains("reduction kind=arg complexity_after=3"));
-        assert!(rendered.contains("argument 0 → 0"));
-    }
-
-    #[test]
-    fn renders_nothing_when_no_reduction_was_accepted() {
-        let minimization = Minimization {
-            attempted: true,
-            strategy: "deterministic",
-            original_complexity: 3,
-            minimized_complexity: 3,
-            preserved: true,
-            reductions: vec![],
-        };
-        let rendered = format_reduction_trace(&minimization.reductions);
-        assert!(rendered.is_empty());
-    }
+/// Convenience for CLI/tests: the ScVal hex of a U32 (expected-return
+/// declarations need the canonical encoding once).
+pub fn u32_scval_hex(n: u32) -> String {
+    encode_scval_xdr_hex(&ScVal::U32(n))
 }
 
 fn status_kind(s: &ReplayStatus) -> &'static str {
@@ -419,15 +393,41 @@ fn determinism_check(
             .collect::<Vec<_>>())
 }
 
-/// Load and validate an artifact from disk (used by tests + the CLI).
-pub fn load_artifact(path: &Path) -> Result<FindingArtifact, ReplayError> {
-    let json = std::fs::read(path)
-        .map_err(|e| ReplayError::Malformed(format!("reading {}: {e}", path.display())))?;
-    parse_artifact(&json)
-}
+#[cfg(test)]
+mod minimization_trace_tests {
+    use super::*;
+    use crate::minimizer::{Minimization, Reduction};
 
-/// Convenience for CLI/tests: the ScVal hex of a U32 (expected-return
-/// declarations need the canonical encoding once).
-pub fn u32_scval_hex(n: u32) -> String {
-    encode_scval_xdr_hex(&ScVal::U32(n))
+    #[test]
+    fn renders_accepted_reductions() {
+        let minimization = Minimization {
+            attempted: true,
+            strategy: "deterministic",
+            original_complexity: 8,
+            minimized_complexity: 3,
+            preserved: true,
+            reductions: vec![Reduction {
+                kind: "arg".into(),
+                detail: "argument 0 → 0".into(),
+                complexity_after: 3,
+            }],
+        };
+        let rendered = format_reduction_trace(&minimization.reductions);
+        assert!(rendered.contains("reduction kind=arg complexity_after=3"));
+        assert!(rendered.contains("argument 0 → 0"));
+    }
+
+    #[test]
+    fn renders_nothing_when_no_reduction_was_accepted() {
+        let minimization = Minimization {
+            attempted: true,
+            strategy: "deterministic",
+            original_complexity: 3,
+            minimized_complexity: 3,
+            preserved: true,
+            reductions: vec![],
+        };
+        let rendered = format_reduction_trace(&minimization.reductions);
+        assert!(rendered.is_empty());
+    }
 }
