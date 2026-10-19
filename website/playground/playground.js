@@ -36,6 +36,8 @@
   // (transactions) will plug in here; the local inspector never touches it.
   const networkProvider = { mode: 'local', supported: ['local'] };
 
+  const REQUEST_TIMEOUT_MS = 30000;  // 30 seconds — timeout for worker requests
+
   let nextId = 1;
   const pending = new Map();
   let currentFile = null;
@@ -96,7 +98,22 @@
   function post(msg) {
     return new Promise((resolve, reject) => {
       const id = nextId++;
-      pending.set(id, { resolve, reject });
+      let timeoutHandle = null;
+      const cleanup = () => {
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+        pending.delete(id);
+      };
+      const resolve_ = (value) => { cleanup(); resolve(value); };
+      const reject_ = (error) => { cleanup(); reject(error); };
+      
+      // Set up the timeout. If it fires, reject the promise and clean up.
+      timeoutHandle = setTimeout(() => {
+        pending.delete(id);
+        const operationName = msg.type || 'unknown operation';
+        reject_(new Error(operationName + ' timed out after ' + REQUEST_TIMEOUT_MS + ' ms'));
+      }, REQUEST_TIMEOUT_MS);
+      
+      pending.set(id, { resolve: resolve_, reject: reject_ });
       worker.postMessage(Object.assign({ id }, msg));
     });
   }
@@ -365,6 +382,20 @@
     metaSec.appendChild(metaTable);
     results.appendChild(metaSec);
 
+    // 1b. Contract metadata (contractmetav0). Rendered verbatim from the
+    // decoded `SCMetaV0` entries — the same `metadata.contract_meta` array the
+    // CLI prints as `Contract Metadata (n):`, in section order, duplicates and
+    // unknown keys preserved. No vocabulary is assumed in JS.
+    const contractMeta = (meta.contract_meta || []).slice();
+    const cmSec = section('Contract Metadata',
+      contractMeta.length + (contractMeta.length === 1 ? ' item' : ' items'));
+    if (contractMeta.length) {
+      cmSec.appendChild(kvTable(contractMeta.map((e) => [e.key, e.value])));
+    } else {
+      cmSec.appendChild(kvTable([['Entries', 'none']]));
+    }
+    results.appendChild(cmSec);
+
     // 2. Exports
     const exps = (meta.exports || []).slice();
     const expSec = section('Exports', exps.length + (exps.length === 1 ? ' item' : ' items'));
@@ -494,10 +525,18 @@
       setStatus('ok', verdict.compatible ? 'upgrade is compatible' : 'breaking changes detected');
     }).catch((err) => {
       if (!isCurrent(gen)) return;
-      setStatus('err', 'comparison failed');
+      const errMsg = String(err && err.message ? err.message : err);
+      const isTimeout = errMsg.includes('timed out');
+      setStatus('err', isTimeout ? 'comparison timed out' : 'comparison failed');
       renderUpgrade(null);
       const sec = results.querySelector('[data-upgrade-safety]');
-      if (sec) sec.appendChild(kvTable([['Error', String(err && err.message ? err.message : err)]]));
+      if (sec) {
+        if (isTimeout) {
+          sec.appendChild(kvTable([['Error', errMsg + '. The comparison timed out; the file may be too large or complex. Reload and try again.']]));
+        } else {
+          sec.appendChild(kvTable([['Error', errMsg]]));
+        }
+      }
     });
   }
 
@@ -539,8 +578,16 @@
       compareFiles(gen);
     }).catch((err) => {
       if (!isCurrent(gen)) return;
-      setStatus('err', 'inspection failed');
-      showError(String(err && err.message ? err.message : err));
+      const errMsg = String(err && err.message ? err.message : err);
+      const isTimeout = errMsg.includes('timed out');
+      setStatus('err', isTimeout ? 'inspection timed out' : 'inspection failed');
+      if (isTimeout) {
+        showError('The inspection timed out (' + errMsg + '). ' +
+          'The file may be too large or complex to process. ' +
+          'You can reload the playground and try again, or try a smaller file.');
+      } else {
+        showError(errMsg);
+      }
     });
   }
 

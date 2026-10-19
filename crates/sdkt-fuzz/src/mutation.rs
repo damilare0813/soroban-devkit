@@ -14,7 +14,7 @@
 
 use sha2::{Digest, Sha256};
 use soroban_env_host::xdr::{
-    Int128Parts, ScBytes, ScMap, ScString, ScVal, ScVec, UInt128Parts, VecM,
+    Int128Parts, ScBytes, ScMap, ScMapEntry, ScString, ScVal, ScVec, UInt128Parts, VecM,
 };
 
 use sdkt_wasm::ContractType;
@@ -53,6 +53,7 @@ pub enum Operator {
     // Map
     MapEmpty,
     MapRemoveOne,
+    MapInsertKey,
 }
 
 impl Operator {
@@ -77,6 +78,7 @@ impl Operator {
             Operator::OptionSomeMutated => "option_some_mutated",
             Operator::MapEmpty => "map_empty",
             Operator::MapRemoveOne => "map_remove_one",
+            Operator::MapInsertKey => "map_insert_key",
         }
     }
 
@@ -109,7 +111,11 @@ impl Operator {
                 Operator::OptionSomeMutated,
             ],
             ("compound", n) if n.starts_with("map<") => {
-                vec![Operator::MapEmpty, Operator::MapRemoveOne]
+                vec![
+                    Operator::MapEmpty,
+                    Operator::MapRemoveOne,
+                    Operator::MapInsertKey,
+                ]
             }
             _ => Vec::new(),
         }
@@ -392,6 +398,41 @@ fn apply_operator(
             }
             _ => return Err(no_mutation()),
         },
+        Operator::MapInsertKey => {
+            let kt = t.type_args.first().ok_or_else(no_mutation)?;
+            let vt = t.type_args.get(1).ok_or_else(no_mutation)?;
+            let mut entries = match current {
+                ScVal::Map(Some(m)) => m.0.to_vec(),
+                _ => Vec::new(),
+            };
+            // Retry up to 100 times to find a key that is unique relative
+            // to existing entries. If we cannot produce one, refuse rather
+            // than silently overwriting an existing key.
+            let max_attempts = 100;
+            let (new_key, new_val) = (0..max_attempts)
+                .find_map(|_| {
+                    let key_bytes = rng.bytes(16);
+                    let key = generate_value(kt, &key_bytes, 1, caps).ok()?;
+                    if entries.iter().any(|e| e.key == key) {
+                        return None; // collision → try again
+                    }
+                    let val_bytes = rng.bytes(16);
+                    let val = generate_value(vt, &val_bytes, 1, caps).ok()?;
+                    Some((key, val))
+                })
+                .ok_or_else(no_mutation)?;
+            entries.push(ScMapEntry {
+                key: new_key,
+                val: new_val,
+            });
+            entries.sort_by(|a, b| a.key.cmp(&b.key));
+            if entries.len() > caps.max_map_entries.saturating_mul(2).max(1) {
+                return Err(no_mutation());
+            }
+            ScVal::Map(Some(ScMap(
+                VecM::try_from(entries).map_err(|_| no_mutation())?,
+            )))
+        }
     };
     Ok(out)
 }
@@ -446,6 +487,15 @@ use soroban_env_host::xdr::StringM;
 /// Deterministically pick the next mutation for a function's arguments:
 /// cycles `(arg_index, operator)` in a stable order derived from the seed
 /// and case id.
+///
+/// For a given `(seed, case_id)`, consecutive steps select distinct
+/// `(arg_index, operator)` pairs whenever the candidate set has more than one
+/// entry — a deterministic permutation walk cycling through candidates
+/// starting from an offset derived from the seed and case id.
+///
+/// When the candidate set has exactly one entry (e.g. single-candidate types
+/// with only one available operator), repeated steps are unavoidable and
+/// subsequent steps will continue to return that single entry.
 pub fn plan_mutation(
     param_types: &[&ContractType],
     seed: &[u8; 32],
@@ -461,8 +511,7 @@ pub fn plan_mutation(
     if candidates.is_empty() {
         return None;
     }
-    let mut rng =
-        SplitMix64::keyed(&[derive_key_child(seed, case_id), step.to_le_bytes().to_vec()].concat());
+    let mut rng = SplitMix64::keyed(&derive_key_child(seed, case_id));
     // Deterministic order: sample a permutation start then walk forward.
     let start = rng.below(candidates.len() as u64) as usize;
     Some(candidates[(start + step) % candidates.len()])

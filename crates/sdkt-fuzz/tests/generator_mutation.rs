@@ -2,7 +2,7 @@
 
 use sdkt_fuzz::{GenerationCaps, GeneratorError, UnsupportedContractType};
 use sdkt_wasm::{parse_contract_spec, ContractSpec, ContractType};
-use soroban_env_host::xdr::ScVal;
+use soroban_env_host::xdr::{ScMap, ScMapEntry, ScVal, VecM};
 
 const COUNTER_WASM: &[u8] = include_bytes!("../../../crates/sdkt-cli/tests/fixtures/us_new.wasm");
 
@@ -453,4 +453,321 @@ fn mutation_deterministic_and_non_targets_preserved() {
         ScVal::Vec(Some(v)) => assert_eq!(v.0.len(), 1),
         other => panic!("expected a vec, got {other:?}"),
     }
+}
+
+#[test]
+fn map_insert_key_operator_is_deterministic_and_typed() {
+    let map = compound(
+        "map<u32, bool>".to_string(),
+        vec![counter_type("u32"), counter_type("bool")],
+    );
+    // Multi-argument baseline: the map is argument 1, so arguments 0 and 2
+    // are non-target. The sentinel is a value no mutation can produce, so
+    // asserting it survives is a real check, not a coincidence.
+    let baseline = vec![
+        ScVal::U64(7),
+        ScVal::Map(Some(ScMap(VecM::try_from(vec![]).unwrap()))),
+        ScVal::Bool(true),
+    ];
+    let seed = [13u8; 32];
+
+    let a = sdkt_fuzz::mutation::mutate_arg(
+        &map,
+        &baseline,
+        1,
+        sdkt_fuzz::Operator::MapInsertKey,
+        &seed,
+        "m",
+        GenerationCaps::default(),
+    )
+    .unwrap();
+    let b = sdkt_fuzz::mutation::mutate_arg(
+        &map,
+        &baseline,
+        1,
+        sdkt_fuzz::Operator::MapInsertKey,
+        &seed,
+        "m",
+        GenerationCaps::default(),
+    )
+    .unwrap();
+
+    // Determinism: same identity → identical mutation.
+    assert_eq!(a, b);
+    assert_eq!(a.mutation_id, b.mutation_id);
+
+    // The result is still a well-typed map.
+    match &a.value {
+        ScVal::Map(Some(m)) => {
+            assert_eq!(m.0.len(), 1, "insert into empty map yields one entry");
+        }
+        other => panic!("expected a map, got {other:?}"),
+    }
+
+    // Non-target arguments are preserved exactly, not just in count.
+    assert_eq!(a.args.len(), baseline.len());
+    assert_eq!(a.args[0], ScVal::U64(7));
+    assert_eq!(a.args[2], ScVal::Bool(true));
+
+    // Operator does not apply to a non-map type.
+    let err = sdkt_fuzz::mutation::mutate_arg(
+        &counter_type("u32"),
+        &baseline,
+        1,
+        sdkt_fuzz::Operator::MapInsertKey,
+        &seed,
+        "m",
+        GenerationCaps::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        sdkt_fuzz::MutationError::OperatorNotApplicableForType { .. }
+    ));
+}
+
+#[test]
+fn map_insert_key_guarantees_new_entry_on_non_empty_map() {
+    // A non-empty map: the operator must add an entry, not replace one.
+    let map = compound(
+        "map<u32, bool>".to_string(),
+        vec![counter_type("u32"), counter_type("bool")],
+    );
+    let existing = ScMap(
+        VecM::try_from(vec![
+            ScMapEntry {
+                key: ScVal::U32(1),
+                val: ScVal::Bool(true),
+            },
+            ScMapEntry {
+                key: ScVal::U32(2),
+                val: ScVal::Bool(false),
+            },
+        ])
+        .unwrap(),
+    );
+    // Multi-argument baseline: the map is argument 1, so arguments 0 and 2
+    // are non-target and must survive untouched.
+    let baseline = vec![ScVal::U64(7), ScVal::Map(Some(existing)), ScVal::Bool(true)];
+    let seed = [29u8; 32];
+
+    let m = sdkt_fuzz::mutation::mutate_arg(
+        &map,
+        &baseline,
+        1,
+        sdkt_fuzz::Operator::MapInsertKey,
+        &seed,
+        "m",
+        GenerationCaps::default(),
+    )
+    .unwrap();
+
+    // Non-target arguments are preserved exactly, not just in count.
+    assert_eq!(m.args[0], ScVal::U64(7));
+    assert_eq!(m.args[2], ScVal::Bool(true));
+
+    let ScVal::Map(Some(after)) = &m.value else {
+        panic!("expected a map, got {:?}", m.value);
+    };
+    assert_eq!(after.0.len(), 3, "one entry must be added");
+
+    // The two pre-existing entries are still present, unchanged.
+    for (key, val) in [
+        (ScVal::U32(1), ScVal::Bool(true)),
+        (ScVal::U32(2), ScVal::Bool(false)),
+    ] {
+        assert!(
+            after.0.iter().any(|e| e.key == key && e.val == val),
+            "pre-existing entry {key:?} => {val:?} was lost"
+        );
+    }
+
+    // Keys stay unique (no silent overwrite).
+    let keys: Vec<_> = after.0.iter().map(|e| e.key.clone()).collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(keys.len(), sorted.len(), "duplicate keys in mutated map");
+}
+
+#[test]
+fn map_insert_key_refuses_when_key_space_is_exhausted() {
+    // map<bool, bool> has exactly two possible keys. With both already
+    // present, no unique key can be produced, so the operator must refuse
+    // instead of overwriting.
+    let map = compound(
+        "map<bool, bool>".to_string(),
+        vec![counter_type("bool"), counter_type("bool")],
+    );
+    let full = ScMap(
+        VecM::try_from(vec![
+            ScMapEntry {
+                key: ScVal::Bool(false),
+                val: ScVal::Bool(true),
+            },
+            ScMapEntry {
+                key: ScVal::Bool(true),
+                val: ScVal::Bool(false),
+            },
+        ])
+        .unwrap(),
+    );
+    let baseline = vec![ScVal::Map(Some(full))];
+
+    let err = sdkt_fuzz::mutation::mutate_arg(
+        &map,
+        &baseline,
+        0,
+        sdkt_fuzz::Operator::MapInsertKey,
+        &[41u8; 32],
+        "m",
+        GenerationCaps::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, sdkt_fuzz::MutationError::NoApplicableMutation),
+        "expected NoApplicableMutation, got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H. Mutation planner tests (plan_mutation distinct steps & cycling)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_mutation_consecutive_steps_differ_for_bool_and_u64() {
+    let t_bool = counter_type("bool");
+    let t_u64 = counter_type("u64");
+    let seed = *b"sdkt-fuzz-phase1-default-seed!!!";
+
+    // 200-case sweep asserting steps 0 and 1 select different operators in 100% of cases
+    for (t, op_count) in [(&t_bool, 2), (&t_u64, 5)] {
+        assert_eq!(sdkt_fuzz::mutation::operators_for(t).len(), op_count);
+        let param_types = [t];
+        let mut duplicates = 0;
+        let cases = 200;
+        for c in 0..cases {
+            let case_id = format!("case{c:04}");
+            let step0 = sdkt_fuzz::mutation::plan_mutation(&param_types, &seed, &case_id, 0)
+                .expect("mutation plan exists");
+            let step1 = sdkt_fuzz::mutation::plan_mutation(&param_types, &seed, &case_id, 1)
+                .expect("mutation plan exists");
+            assert_ne!(
+                step0, step1,
+                "step 0 and step 1 must differ for case {case_id} on type {}",
+                t.name
+            );
+            if step0 == step1 {
+                duplicates += 1;
+            }
+        }
+        assert_eq!(
+            duplicates, 0,
+            "100% of sampled cases must select different operators between consecutive steps"
+        );
+    }
+}
+
+#[test]
+fn plan_mutation_reaches_full_candidate_set_in_len_steps() {
+    let t_bool = counter_type("bool");
+    let t_u64 = counter_type("u64");
+    let seed = *b"sdkt-fuzz-phase1-default-seed!!!";
+
+    let test_cases: Vec<Vec<&ContractType>> =
+        vec![vec![&t_bool], vec![&t_u64], vec![&t_bool, &t_u64]];
+
+    for param_types in test_cases {
+        let mut expected_candidates: Vec<(usize, sdkt_fuzz::Operator)> = Vec::new();
+        for (i, t) in param_types.iter().enumerate() {
+            for op in sdkt_fuzz::mutation::operators_for(t) {
+                expected_candidates.push((i, op));
+            }
+        }
+        let total = expected_candidates.len();
+
+        for c in 0..50 {
+            let case_id = format!("case{c:04}");
+            let mut visited = std::collections::BTreeSet::new();
+            for step in 0..total {
+                let choice =
+                    sdkt_fuzz::mutation::plan_mutation(&param_types, &seed, &case_id, step)
+                        .expect("mutation plan exists");
+                assert!(
+                    visited.insert(choice),
+                    "duplicate candidate {:?} visited at step {} for case {}",
+                    choice,
+                    step,
+                    case_id
+                );
+            }
+            assert_eq!(
+                visited.len(),
+                total,
+                "across candidates.len() steps, every candidate must be selected exactly once"
+            );
+        }
+    }
+}
+
+#[test]
+fn plan_mutation_determinism_across_repeated_calls() {
+    let t_u64 = counter_type("u64");
+    let param_types = [&t_u64];
+    let seed = *b"sdkt-fuzz-phase1-default-seed!!!";
+
+    for c in 0..20 {
+        let case_id = format!("case{c:04}");
+        for step in 0..10 {
+            let call1 = sdkt_fuzz::mutation::plan_mutation(&param_types, &seed, &case_id, step);
+            let call2 = sdkt_fuzz::mutation::plan_mutation(&param_types, &seed, &case_id, step);
+            assert_eq!(
+                call1, call2,
+                "plan_mutation must be deterministic across calls"
+            );
+        }
+    }
+}
+
+#[test]
+fn plan_mutation_single_candidate_repeats() {
+    // A primitive type with a single fallback operator (Operator::Random)
+    let t_single = counter_type("custom_opaque");
+    assert_eq!(
+        sdkt_fuzz::mutation::operators_for(&t_single),
+        vec![sdkt_fuzz::Operator::Random]
+    );
+    let param_types = [&t_single];
+    let seed = *b"sdkt-fuzz-phase1-default-seed!!!";
+
+    for c in 0..10 {
+        let case_id = format!("case{c:04}");
+        let step0 = sdkt_fuzz::mutation::plan_mutation(&param_types, &seed, &case_id, 0);
+        let step1 = sdkt_fuzz::mutation::plan_mutation(&param_types, &seed, &case_id, 1);
+        assert_eq!(
+            step0,
+            Some((0, sdkt_fuzz::Operator::Random)),
+            "single candidate must return Operator::Random"
+        );
+        assert_eq!(
+            step0, step1,
+            "single-candidate type is documented to repeat across consecutive steps"
+        );
+    }
+}
+
+#[test]
+fn campaign_summary_reports_counts() {
+    let result = sdkt_fuzz::CampaignResult {
+        executed: 4,
+        passed: vec!["case0000".into(), "case0001".into()],
+        expected_errors: vec![],
+        findings: vec![],
+        skipped_functions: vec![],
+    };
+    let summary = sdkt_fuzz::campaign::summarize(&result);
+    assert_eq!(
+        summary,
+        "executed=4 passed=2 expected_errors=0 findings=0 skipped=0"
+    );
 }
